@@ -23,6 +23,7 @@ HY2 主节点使用 UDP/QUIC 与正式 TLS。普通临时节点、WG-NAT 临时�
 | 当前来源 IP 与 UDP 监听 | [查来源 IP](#active-ips) |
 | 共享线索、异常日志与可选实时 TCP 目标 | `PORT=40020 DAYS=7 hy2-abuse`（[首次安装](#abuse-install)） |
 | 全部受管理黑名单与端口暂停 | [查黑名单](#blacklist-report) |
+| 全部来源 IP 白名单 | [查白名单](#source-allowlist) |
 | SOCKS5 账号、有效期、总配额和来源占位 | 在**独立落地机**执行 `socks5 list` |
 | SOCKS5 每日流量、链接和访问审计 | [每日用量](#socks5-daily) / `socks5 link 41004` / [审计](#socks5-access) |
 | NAT 出口机运行状态 | 在 NAT 机执行 `bash /root/nat.sh status` |
@@ -888,6 +889,7 @@ journalctl -u hy2.service -n 50 --no-pager
 | 暂停整个端口 | `hy2-guard pause 40020` | 不删除节点、不清除配额 |
 | 按来源 IP 或网段封禁 | `hy2-guard ban 40020 203.0.113.0/24` | 不影响其他端口 |
 | 查询已管理的暂停与黑名单 | `hy2-guard status` | 只读 |
+| 仅允许指定来源访问本机端口 | [来源 IP 白名单](#source-allowlist) | IPv4 / IPv6，可选 TCP / UDP |
 
 <details>
 <summary>首次安装手工防护工具（HY2 VPS）</summary>
@@ -1006,6 +1008,59 @@ systemctl is-active hy2-manual-guard.service
 ```
 
 不应手工清除整张 nftables 规则表；节点成功删除时会清理其受管暂停和来源黑名单，防止端口复用继承旧规则。`IP_LIMIT` 是来源 IP 占位数控制，与永久黑名单不是同一件事。
+
+<a id="source-allowlist"></a>
+
+### 来源 IP 白名单
+
+按来源 IPv4/IPv6 限制本机监听端口的 TCP 或 UDP 入站流量。在实际监听该端口的主机上，用 **root + Bash** 逐条执行。需要 `nftables`、Python 3.9 或更新版本，以及 systemd。`P` 填本机实际监听端口，IP 填主机看到的客户端来源地址。
+
+| `PROTO` | 应用范围 |
+|---|---|
+| `tcp` | TCP 入口，例如 VLESS、SOCKS5 |
+| `udp` | UDP 入口，例如 Hysteria2 |
+| `both` | 同一数字端口的 TCP 和 UDP 共用一份 IP 名单 |
+
+选定协议后，`IPS4` 或 `IPS6` 留空会拦截该地址族的非回环入站流量，至少填写一个地址。名单内的地址仍需满足主机上其他防火墙规则。
+
+<details>
+<summary>展开四条单行命令</summary>
+
+#### ① 添加或修改白名单
+
+修改行首的 `P`、`PROTO`、`IPS4` 和 `IPS6`。把示例 IP 换成实际允许的客户端出口 IP，多个地址用空格分隔。再次执行会替换该端口的协议选择和 IP 名单，并保存配置、启用开机恢复。
+
+```bash
+P=41004 PROTO=both IPS4="203.0.113.10 198.51.100.20" IPS6="" python3 -c 'exec("import fcntl\nimport ipaddress\nimport os\nimport subprocess\nfrom pathlib import Path\n\nport = int(os.environ[\"P\"])\nif os.geteuid() != 0 or not 1 <= port <= 65535:\n    raise SystemExit(\"需要 root，端口必须为 1–65535\")\nmode = os.environ.get(\"PROTO\", \"tcp\").lower()\nif mode not in (\"tcp\", \"udp\", \"both\"):\n    raise SystemExit(\"PROTO 必须为 tcp、udp 或 both\")\nprotocols = (\"tcp\", \"udp\") if mode == \"both\" else (mode,)\n\n\ndef addresses(name, address_type):\n    values = os.environ[name].replace(\",\", \" \").split()\n    if any(\"%\" in ip for ip in values):\n        raise SystemExit(\"请填写不带网卡后缀的 IP\")\n    return list(dict.fromkeys(str(address_type(ip)) for ip in values))\n\n\nipv4 = addresses(\"IPS4\", ipaddress.IPv4Address)\nipv6 = addresses(\"IPS6\", ipaddress.IPv6Address)\nif not (ipv4 or ipv6):\n    raise SystemExit(\"IPv4、IPv6 不能同时为空\")\n\ntable = f\"s5wl_{port}\"\ndirectory = Path(\"/etc/jsh-whitelist\")\nunit = Path(\"/etc/systemd/system/jsh-whitelist@.service\")\nhead = (\n    f\"add table inet {table}\\n\"\n    f\"add chain inet {table} input {{ type filter hook input priority -30; policy accept; }}\\n\"\n)\nrules = \"\"\nfor protocol in protocols:\n    for family, source, ips in ((\"ipv4\", \"ip\", ipv4), (\"ipv6\", \"ip6\", ipv6)):\n        exception = f\"{source} saddr != {{ {\u0027, \u0027.join(ips)} }} \" if ips else \"\"\n        rules += (\n            f\u0027add rule inet {table} input meta nfproto {family} \u0027\n            f\u0027iifname != \"lo\" {protocol} dport {port} {exception}drop\\n\u0027\n        )\n\nwith open(\"/run/lock/jsh-whitelist.lock\", \"a\") as lock:\n    fcntl.flock(lock, fcntl.LOCK_EX)\n    tables = subprocess.check_output([\"nft\", \"-n\", \"list\", \"tables\"], text=True)\n    exists = f\"table inet {table}\" in tables.splitlines()\n    batch = (f\"flush chain inet {table} input\\n\" if exists else head) + rules\n    subprocess.run([\"nft\", \"-c\", \"-f\", \"-\"], input=batch, text=True, check=True)\n    subprocess.run([\"nft\", \"-f\", \"-\"], input=batch, text=True, check=True)\n    directory.mkdir(mode=0o700, exist_ok=True)\n    temp = directory / f\".{port}.tmp\"\n    temp.write_text(head + rules, encoding=\"utf-8\")\n    temp.chmod(0o600)\n    temp.replace(directory / f\"{port}.nft\")\n    unit.write_text(\"\"\"[Unit]\nDescription=Jieshu IP whitelist %i\nDefaultDependencies=no\nAfter=local-fs.target nftables.service\nBefore=sysinit.target network-pre.target\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStartPre=-/usr/sbin/nft delete table inet s5wl_%i\nExecStart=/usr/sbin/nft -f /etc/jsh-whitelist/%i.nft\n[Install]\nWantedBy=sysinit.target\n\"\"\", encoding=\"utf-8\")\n    subprocess.run([\"systemctl\", \"daemon-reload\"], check=True)\n    subprocess.run([\"systemctl\", \"enable\", f\"jsh-whitelist@{port}.service\"], check=True)\n\nprint(f\"端口 {port}：白名单已更新，开机恢复已启用\")\nprint(\"协议：\" + \"、\".join(protocol.upper() for protocol in protocols))\nprint(\"IPv4：\" + (\"、\".join(ipv4) or \"禁止\"))\nprint(\"IPv6：\" + (\"、\".join(ipv6) or \"禁止\"))")'
+```
+
+#### ② 查询全部白名单
+
+直接执行，显示本机的白名单端口、协议、IPv4/IPv6 名单、运行状态和开机恢复状态。
+
+```bash
+python3 -c 'exec("import ipaddress\nimport re\nimport subprocess\nfrom pathlib import Path\n\ndirectory = Path(\"/etc/jsh-whitelist\")\ntables = subprocess.check_output([\"nft\", \"-n\", \"list\", \"tables\"], text=True)\nlive = {int(p) for p in re.findall(r\"(?m)^table inet s5wl_([1-9][0-9]{0,4})$\", tables)}\nsaved = {\n    int(file.stem): file for file in directory.glob(\"*.nft\")\n    if re.fullmatch(r\"[1-9][0-9]{0,4}\", file.stem)\n}\nports = sorted(p for p in live | saved.keys() if p <= 65535)\nfamilies = {\"2\": 4, \"ipv4\": 4, \"10\": 6, \"ipv6\": 6}\nsources = {\"ip\": 4, \"ip6\": 6}\n\n\ndef parse(lines, port):\n    rule = re.compile(\n        rf\u0027(?:meta nfproto (ipv4|ipv6|2|10)\\s+)?\u0027\n        rf\u0027iifname\\s+!=\\s+\"lo\"\\s+(tcp|udp)\\s+dport\\s+{port}\\s+\u0027\n        rf\u0027(?:(ip6?) saddr\\s+!=\\s+(\\{{[^{{}}]+\\}}|\\S+)\\s+)?drop\u0027\n    )\n    lists = {}\n    valid = bool(lines)\n    for line in lines:\n        match = rule.fullmatch(line.strip())\n        if not match:\n            valid = False\n            continue\n        family, protocol, source, values = match.groups()\n        explicit = families.get(family)\n        version = sources.get(source, explicit)\n        if version is None or explicit not in (None, version):\n            valid = False\n            continue\n        key = protocol, version\n        if key in lists:\n            valid = False\n            continue\n        try:\n            ips = [ipaddress.ip_address(ip.strip()) for ip in values.strip(\"{}\").split(\",\")] if values else []\n            if any(ip.version != version or \"%\" in str(ip) for ip in ips):\n                raise ValueError\n            lists[key] = \"、\".join(map(str, ips)) or \"禁止\"\n        except ValueError:\n            valid = False\n    protocols = [p for p in (\"tcp\", \"udp\") if any((p, v) in lists for v in (4, 6))]\n    valid = valid and bool(protocols) and all(\n        (p, v) in lists for p in protocols for v in (4, 6)\n    )\n    return protocols, lists, valid\n\n\nprint(f\"========== IP白名单（{len(ports)}个端口）==========\")\nfor port in ports:\n    table = f\"s5wl_{port}\"\n    if port in live:\n        result = subprocess.run(\n            [\"nft\", \"-n\", \"list\", \"chain\", \"inet\", table, \"input\"],\n            capture_output=True, text=True\n        )\n        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]\n        has_hook = any(re.fullmatch(r\"type filter hook input priority .+; policy accept;\", line) for line in lines)\n        headers = (f\"table inet {table} {{\", \"chain input {\", \"}\")\n        lines = [line for line in lines if line not in headers and not line.startswith(\"type \")]\n        if result.returncode or not has_hook:\n            lines = []\n    else:\n        prefix = f\"add rule inet {table} input \"\n        lines = [\n            line.removeprefix(prefix) for line in saved[port].read_text(encoding=\"utf-8\").splitlines()\n            if line.startswith(prefix)\n        ]\n    protocols, lists, valid = parse(lines, port)\n    state = (\"正常\" if valid else \"规则异常\") if port in live else \"未生效\"\n    enabled = port in saved and subprocess.run(\n        [\"systemctl\", \"is-enabled\", \"--quiet\", f\"jsh-whitelist@{port}.service\"],\n        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL\n    ).returncode == 0\n    boot = \"已启用\" if enabled else \"未启用\"\n    print(f\"\\n【端口 {port}】 {state} | 开机恢复：{boot}\")\n    print(\"协议：\" + (\"、\".join(p.upper() for p in protocols) or \"规则异常\"))\n    for protocol in protocols:\n        for version in (4, 6):\n            print(f\"{protocol.upper()} IPv{version}：{lists.get((protocol, version), \u0027规则异常\u0027)}\")\n\nif not ports:\n    print(\"没有设置任何白名单\")")'
+```
+
+#### ③ 解除指定端口白名单
+
+修改行首的 `P`，删除指定端口的白名单规则和保存文件，并禁用该端口的开机恢复。
+
+```bash
+P=41004 python3 -c 'exec("import fcntl\nimport os\nimport re\nimport subprocess\nimport sys\nfrom pathlib import Path\n\nif os.geteuid() != 0:\n    raise SystemExit(\"必须使用 root\")\nall_ports = sys.argv[1:] == [\"--all\"]\nport = None if all_ports else int(os.environ[\"P\"])\nif port is not None and not 1 <= port <= 65535:\n    raise SystemExit(\"端口必须为 1–65535\")\ndirectory = Path(\"/etc/jsh-whitelist\")\ntemplate = Path(\"/etc/systemd/system/jsh-whitelist@.service\")\nboot_directory = template.parent / \"sysinit.target.wants\"\n\n\ndef numbers(pattern, body):\n    return {int(item) for item in re.findall(pattern, body) if 1 <= int(item) <= 65535}\n\n\nwith open(\"/run/lock/jsh-whitelist.lock\", \"a\") as lock:\n    fcntl.flock(lock, fcntl.LOCK_EX)\n    tables = subprocess.check_output([\"nft\", \"-n\", \"list\", \"tables\"], text=True)\n    live = numbers(r\"(?m)^table inet s5wl_([1-9][0-9]{0,4})$\", tables)\n    listed = subprocess.check_output(\n        [\"systemctl\", \"list-unit-files\", \"--no-legend\", \"--no-pager\"], text=True\n    )\n    loaded = subprocess.check_output(\n        [\"systemctl\", \"list-units\", \"--type=service\", \"--all\", \"--plain\",\n         \"--no-legend\", \"--no-pager\"], text=True\n    )\n    links = \"\\n\".join(link.name for link in boot_directory.glob(\"jsh-whitelist@*.service\"))\n    units = numbers(\n        r\"(?m)^\\s*jsh-whitelist@([1-9][0-9]{0,4})\\.service(?:\\s|$)\",\n        \"\\n\".join((listed, loaded, links))\n    )\n    saved = numbers(\n        r\"(?m)^([1-9][0-9]{0,4})\\.nft$\", \"\\n\".join(file.name for file in directory.glob(\"*.nft\"))\n    )\n    targets = sorted(live | saved | units) if all_ports else [port]\n    for item in targets:\n        if item in units or template.is_file():\n            subprocess.run(\n                [\"systemctl\", \"disable\", \"--now\", f\"jsh-whitelist@{item}.service\"],\n                check=True\n            )\n        if item in live:\n            subprocess.run([\"nft\", \"delete\", \"table\", \"inet\", f\"s5wl_{item}\"], check=True)\n        (directory / f\"{item}.nft\").unlink(missing_ok=True)\n        (directory / f\".{item}.tmp\").unlink(missing_ok=True)\n        print(f\"端口 {item}：白名单已解除\")\n\nif all_ports:\n    print(f\"共解除 {len(targets)} 个端口\" if targets else \"没有需要解除的白名单\")")'
+```
+
+#### ④ 解除所有端口白名单
+
+**直接执行会批量解除本机所有由本节命令管理的端口白名单**，包括运行规则、保存文件和开机启用项。
+
+```bash
+python3 -c 'exec("import fcntl\nimport os\nimport re\nimport subprocess\nimport sys\nfrom pathlib import Path\n\nif os.geteuid() != 0:\n    raise SystemExit(\"必须使用 root\")\nall_ports = sys.argv[1:] == [\"--all\"]\nport = None if all_ports else int(os.environ[\"P\"])\nif port is not None and not 1 <= port <= 65535:\n    raise SystemExit(\"端口必须为 1–65535\")\ndirectory = Path(\"/etc/jsh-whitelist\")\ntemplate = Path(\"/etc/systemd/system/jsh-whitelist@.service\")\nboot_directory = template.parent / \"sysinit.target.wants\"\n\n\ndef numbers(pattern, body):\n    return {int(item) for item in re.findall(pattern, body) if 1 <= int(item) <= 65535}\n\n\nwith open(\"/run/lock/jsh-whitelist.lock\", \"a\") as lock:\n    fcntl.flock(lock, fcntl.LOCK_EX)\n    tables = subprocess.check_output([\"nft\", \"-n\", \"list\", \"tables\"], text=True)\n    live = numbers(r\"(?m)^table inet s5wl_([1-9][0-9]{0,4})$\", tables)\n    listed = subprocess.check_output(\n        [\"systemctl\", \"list-unit-files\", \"--no-legend\", \"--no-pager\"], text=True\n    )\n    loaded = subprocess.check_output(\n        [\"systemctl\", \"list-units\", \"--type=service\", \"--all\", \"--plain\",\n         \"--no-legend\", \"--no-pager\"], text=True\n    )\n    links = \"\\n\".join(link.name for link in boot_directory.glob(\"jsh-whitelist@*.service\"))\n    units = numbers(\n        r\"(?m)^\\s*jsh-whitelist@([1-9][0-9]{0,4})\\.service(?:\\s|$)\",\n        \"\\n\".join((listed, loaded, links))\n    )\n    saved = numbers(\n        r\"(?m)^([1-9][0-9]{0,4})\\.nft$\", \"\\n\".join(file.name for file in directory.glob(\"*.nft\"))\n    )\n    targets = sorted(live | saved | units) if all_ports else [port]\n    for item in targets:\n        if item in units or template.is_file():\n            subprocess.run(\n                [\"systemctl\", \"disable\", \"--now\", f\"jsh-whitelist@{item}.service\"],\n                check=True\n            )\n        if item in live:\n            subprocess.run([\"nft\", \"delete\", \"table\", \"inet\", f\"s5wl_{item}\"], check=True)\n        (directory / f\"{item}.nft\").unlink(missing_ok=True)\n        (directory / f\".{item}.tmp\").unlink(missing_ok=True)\n        print(f\"端口 {item}：白名单已解除\")\n\nif all_ports:\n    print(f\"共解除 {len(targets)} 个端口\" if targets else \"没有需要解除的白名单\")")' --all
+```
+
+</details>
+
+**实测结果**　在 Debian 13 VPS 的临时监听端口验证了 IPv4/IPv6 的 TCP、UDP 放行与拦截，以及查询、单端口解除和全部解除。实际重启 VPS 后，systemd 自动加载了白名单，放行与拦截复测通过。
 
 <a id="node-manage"></a>
 
